@@ -1,0 +1,30 @@
+[package]
+name = "cs2-esp"
+version = "0.3.0"
+edition = "2021"
+
+# windows-rs PINÉ en 0.58.0 — toutes les signatures du code ont été vérifiées
+# contre le code source du tag 0.58.0 (github.com/microsoft/windows-rs).
+# En cas de bump de version: héritage COM, gates de features et naming des
+# champs (camelCase) sont les points qui cassent — voir l'en-tête overlay.rs.
+[dependencies]
+windows = { version = "=0.58.0", features = [
+    "Win32_Foundation",
+    "Foundation_Numerics", # ← débloque ID2D1RenderTarget::CreateSolidColorBrush (feature-gated)
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls", # ← BST_CHECKED/BST_UNCHECKED (cases à cocher du panneau GUI)
+    "Win32_Graphics_DirectWrite", # ← DWriteCreateFactory/IDWriteTextFormat — texte du menu glass (alpha prémultiplié)
+] }
+
+[profile.release]
+lto = "thin"
