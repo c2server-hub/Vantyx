@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "cs2-esp"
-version = "0.3.0"
-dependencies = [
- "windows",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -43,6 +36,20 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "vantyx"
+version = "0.9.6"
+dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "vantyx-launcher"
+version = "2.0.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "windows"

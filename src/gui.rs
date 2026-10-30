@@ -121,7 +121,7 @@ impl Panel {
             let hinst: HINSTANCE = hmodule.into();
 
             CLASS_DONE.get_or_init(|| {
-                let class = wide("cs2_esp_panel_wnd");
+                let class = wide("vantyx_panel_wnd");
                 let mut wc: WNDCLASSEXW = std::mem::zeroed();
                 wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
                 wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -131,8 +131,8 @@ impl Panel {
                 RegisterClassExW(&wc);
             });
 
-            let class = wide("cs2_esp_panel_wnd");
-            let title = wide("cs2-esp — panneau de contrôle");
+            let class = wide("vantyx_panel_wnd");
+            let title = wide("Vantyx.cc — panneau de contrôle");
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 PCWSTR(class.as_ptr()),

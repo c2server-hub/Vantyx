@@ -1,7 +1,8 @@
 // overlay — fenêtre layerée, alpha PAR PIXEL (UpdateLayeredWindow), boîtes,
-// SQUELETTE, RADAR, menu glass Direct2D, texte DirectWrite, TRIGGERBOT.
+// SQUELETTE, RADAR, menu glass Direct2D, texte DirectWrite, TRIGGERBOT,
+// AIMBOT v0.4.
 //
-// ARCHITECTURE v0.3.0:
+// ARCHITECTURE v0.4.0:
 //   DIB section 32bpp top-down (CreateDIBSection) → DC render target Direct2D
 //   en mode PREMULTIPLIED → dessin D2D + texte DirectWrite → UpdateLayered-
 //   Window(ULW_ALPHA) présente le bitmap prémultiplié.
@@ -46,13 +47,17 @@
 use std::time::Instant;
 
 use crate::debug;
-use crate::entity::{self, Snapshot, BONE_CONNECTS, B_HEAD};
+use crate::entity::{self, Snapshot, BONE_CONNECTS, B_HEAD, JOINT_BONES};
 use crate::gui;
-use crate::math::PLAYER_HEIGHT;
+use crate::math::{PLAYER_HEIGHT, Vec3};
 use crate::mem::Mem;
 use crate::menu::{self, mix4, Action, Align, Mouse, Options, PALETTES, StatusInfo};
+use crate::modules;
 use crate::offsets::Offsets;
-use crate::{dlog, dwarn};
+use crate::theme::{self, CustomColors};
+use crate::thirdperson;
+use crate::world;
+use crate::{aimbot, dlog, dwarn};
 
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -87,24 +92,33 @@ use windows::Win32::Graphics::Gdi::{
     OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::Sleep;
+use windows::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject, Sleep,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE,
+};
+// NOTE windows-rs 0.58: dwflags de CreateWaitableTimerExW est un u32 BRUT
+// (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 2u32), PAS le type flags — la
+// signature générique P0 prend PCWSTR::null() pour un timer sans nom.
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, VIRTUAL_KEY, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEINPUT, VK_CONTROL, VK_END, VK_F1, VK_F2, VK_F4, VK_F8, VK_INSERT,
-    VK_MENU, VK_SHIFT, VK_XBUTTON2,
+    VK_F10, VK_MENU, VK_SHIFT, VK_SPACE, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, CS_HREDRAW, CS_VREDRAW, CURSORINFO, CURSOR_SHOWING, DefWindowProcW,
     DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect, GetCursorInfo,
     GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE,
     HWND_TOPMOST, IsIconic, MSG, MoveWindow, PeekMessageW, PM_REMOVE, RegisterClassExW, ShowWindow,
-    SetWindowLongPtrW, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
-    SM_CXSCREEN, SM_CYSCREEN, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WM_QUIT, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_HIDE, SW_SHOW, SM_CXSCREEN, SM_CYSCREEN, TranslateMessage, ULW_ALPHA,
+    UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW,
+    WM_QUIT, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP, WS_VISIBLE,
 };
 
 pub enum ExitCode {
@@ -181,13 +195,23 @@ fn cursor_visible() -> bool {
 // EXISTS) et run() retournait Fatal pour de mauvaises raisons.
 static OVERLAY_CLASS_DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+/// v0.6.1 — horloge d'animation des PULSES bombe (bandeau + ESP marqueur).
+/// L'ancien code faisait Instant::now().elapsed() — TOUJOURS ≈ 0 par
+/// construction → le pulse était figé (0.5 constant, aucune pulsation).
+/// Un epoch fixé au boot et lu par elapsed() donne une vraie rampe de temps.
+static BOMB_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn bomb_phase() -> f32 {
+    BOMB_EPOCH.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
 fn create_overlay_window() -> Result<HWND, String> {
     unsafe {
         let hmodule = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e}"))?;
         let hinst: HINSTANCE = hmodule.into();
 
         OVERLAY_CLASS_DONE.get_or_init(|| {
-            let class = wide("cs2_esp_wnd");
+            let class = wide("vantyx_wnd");
             let mut wc: WNDCLASSEXW = std::mem::zeroed();
             wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
             wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -197,9 +221,9 @@ fn create_overlay_window() -> Result<HWND, String> {
             RegisterClassExW(&wc);
         });
 
-        let class = wide("cs2_esp_wnd");
+        let class = wide("vantyx_wnd");
 
-        let title = wide("cs2-esp overlay");
+        let title = wide("Vantyx.cc overlay");
         let (x, y, w, h) = game_window_bounds().unwrap_or_else(|| {
             (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
         });
@@ -252,6 +276,24 @@ fn set_click_through(hwnd: HWND, click_through: bool) {
     }
 }
 
+/// v0.5 — STREAMPROOF: WDA_EXCLUDEFROMCAPTURE rend l'overlay invisible aux
+/// captures d'écran (OBS, Discord screen-share, ShadowPlay, Snipping Tool) —
+/// les spectateurs voient le jeu, jamais le cheat. Requiert Win10 2004+;
+/// l'échec (Windows plus vieux) est journalisé sans casser l'overlay.
+fn apply_streamproof(hwnd: HWND, on: bool) {
+    unsafe {
+        let r = if on {
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        } else {
+            SetWindowDisplayAffinity(hwnd, Default::default()) // WDA_NONE
+        };
+        match r {
+            Ok(()) => dlog!("[strm] WDA_EXCLUDEFROMCAPTURE = {}", on),
+            Err(e) => dwarn!("[strm] SetWindowDisplayAffinity({on}) a échoué: {e} — Windows < 2004 ?"),
+        }
+    }
+}
+
 /// front descendant d'une touche (bit 0x8000 + mémoire de l'état précédent).
 fn pressed(vk: VIRTUAL_KEY, prev: &mut bool) -> bool {
     let down = unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 };
@@ -268,6 +310,21 @@ fn trigger_key_down(sel: usize) -> bool {
         2 => VK_XBUTTON2,
         _ => VK_SHIFT,
     };
+    vk_down(vk)
+}
+
+/// touche de l'aimbot enfoncée ? (0=ALT 1=CTRL 2=BTN4 3=MAJ 4=AUTO=permanent)
+fn aim_key_down(sel: usize) -> bool {
+    match sel {
+        0 => vk_down(VK_MENU),
+        1 => vk_down(VK_CONTROL),
+        2 => vk_down(VK_XBUTTON2),
+        3 => vk_down(VK_SHIFT),
+        _ => true, // AUTO — visée permanente quand activé
+    }
+}
+
+fn vk_down(vk: VIRTUAL_KEY) -> bool {
     unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
 }
 
@@ -291,60 +348,179 @@ fn send_click(down: bool) {
     }
 }
 
+// ═══ v0.8 — TIMER HAUTE RÉSOLUTION: LA FIN DU SACCAGE ═════════════════════
+// Le Sleep(1) de Windows a une granularité PAR DÉFAUT de 15,625 ms: sans
+// timeBeginPeriod(1), la boucle "1 kHz" courait en réalité à ~64-128 Hz avec
+// des intervalles irréguliers — une itération sur deux dormait 15 ms. DEUX
+// correctifs:
+//   1. timeBeginPeriod(1) au boot: granularité système globale à ~1 ms
+//      (profite aussi aux sleeps internes du jeu et de notre rendu).
+//   2. waitable timer CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+):
+//      précision ~0,5 ms SONDÉE PAR LE TIMER lui-même (pas d'arrondi système).
+//      Le wait() retombe sur Sleep si la création échoue (vieux Windows).
+struct HiResWait {
+    timer: Option<HANDLE>,
+}
+
+impl HiResWait {
+    fn new() -> HiResWait {
+        let timer = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_MODIFY_STATE.0,
+            )
+            .ok()
+        };
+        if timer.is_none() {
+            // pas fatal: timeBeginPeriod(1) donne déjà Sleep(1) ≈ 1-2 ms
+            dwarn!("waitable timer HR indisponible — repli Sleep (granularité 1 ms)");
+        }
+        HiResWait { timer }
+    }
+
+    /// attend `ms` millisecondes — timer haute résolution si dispo.
+    fn wait(&self, ms: u32) {
+        let Some(h) = self.timer else {
+            unsafe { Sleep(ms) };
+            return;
+        };
+        // due time NÉGATIF = relatif, en unités de 100 ns
+        let due: i64 = -(ms as i64) * 10_000;
+        unsafe {
+            if SetWaitableTimer(h, &due, 0, None, None, false).is_ok()
+                && WaitForSingleObject(h, ms + 50) == WAIT_OBJECT_0
+            {
+                return;
+            }
+            // échec inattendu → ne jamais bloquer la boucle plus que prévu
+            Sleep(ms);
+        }
+    }
+}
+
+impl Drop for HiResWait {
+    fn drop(&mut self) {
+        if let Some(h) = self.timer.take() {
+            unsafe { let _ = windows::Win32::Foundation::CloseHandle(h); }
+        }
+    }
+}
+
 // ═══ machine à états du triggerbot ═════════════════════════════════════════
 // Idle → (conditions réunies) → Armed(délai réaction) → Firing(clic tenu
 // ~45 ms) → Cooldown(~120 ms) → Idle. Les conditions qui lâchent en plein
 // tir relâchent le clic immédiatement.
+// v0.8 — DÉLAI GAUSSIEN: l'ancien délai FIXE répété des centaines de fois
+// était une signature statistique parfaite (un humain ne tire jamais au ms
+// près). Chaque armement tire un NOUVEAU délai ~ N(mean, 0.35·mean) borné
+// [0.4·mean, 2.2·mean] — la distribution devient organique, impossible à
+// distinguer d'un vrai temps de réaction humain.
 #[derive(Debug)]
 enum TrigState {
     Idle,
-    Armed(Instant),
+    Armed(Instant, u32), // (t0, délai TIRÉ — plus fixe)
     Firing(Instant),
     Cooldown(Instant),
+}
+
+/// RNG xorshift32 + Box-Muller — gaussienne centrée, pour le délai.
+struct GaussRng(u32);
+impl GaussRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0 | 1;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+    /// ~ N(0, 1) via Box-Muller (une seule gaussienne tirée, zéro trig)
+    fn normal(&mut self) -> f32 {
+        let u1 = (self.next_u32() >> 8) as f32 / 16777216.0 + 1e-7; // (0, 1]
+        let u2 = (self.next_u32() >> 8) as f32 / 16777216.0;
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+    /// tir de délai humain: moyenne `mean_ms`, sigma 35% de la moyenne,
+    /// bornes [40%, 220%] de la moyenne — jamais négatif, jamais plat.
+    fn delay_around(&mut self, mean_ms: f32) -> u32 {
+        if mean_ms < 1.0 {
+            return 0; // 0 ms demandé = instantané assumé (mode rage)
+        }
+        let sigma = (mean_ms * 0.35).max(1.0);
+        let z = self.normal().clamp(-2.5, 2.5); // queues tronquées
+        (mean_ms + z * sigma).clamp(mean_ms * 0.4, mean_ms * 2.2).max(0.0) as u32
+    }
 }
 
 struct TriggerBot {
     state: TrigState,
     pub armed_visual: bool, // affiché: viseur sur ennemi + touche tenue
+    rng: GaussRng,          // v0.8 — délai gaussien
 }
 
 impl TriggerBot {
     fn new() -> Self {
-        TriggerBot { state: TrigState::Idle, armed_visual: false }
+        let mut rng = GaussRng(0x6D2B79F5);
+        rng.next_u32(); // échauffe l'état
+        TriggerBot { state: TrigState::Idle, armed_visual: false, rng }
     }
 
-    /// conditions = ennemi vivant sous le viseur + touche tenue + contexte OK
-    fn update(&mut self, conditions: bool, delay_ms: u32) {
-        const HOLD_MS: u128 = 45;
-        const COOLDOWN_MS: u128 = 120;
+    /// conditions = tir autorisé (gate tête / zone) + touche tenue +
+    /// contexte OK. `delay_ms` = MOYENNE du tirage gaussien (le slider du
+    /// menu). `fast_head` = le tir est qualifié TÊTE (gate physique
+    /// aimbot): le délai est réduit à 40 % de la moyenne — la solution est
+    /// déjà calculée, la main « était déjà en route ».
+    ///
+    /// v0.9.6 — CYCLE v3 (« à chaque tir je touche la tête »):
+    ///   · HOLD COMPLET COMMISS: une fois le down parti, les 18 ms sont
+    ///     tenues MÊME SI les conditions lâchent. Le usercmd de CS2
+    ///     échantillonne l'état des boutons au tick (64 Hz = 15.6 ms): un
+    ///     up après 2-3 ms (blip du cache d'os entre deux ticks, zone qui
+    ///     déblippe un frame) = un down JAMAIS VU = clic PERDU — c'était
+    ///     le « des fois il ne tire pas ». Le tir est commis, on le finit.
+    ///   · COOLDOWN 30 → 20 ms: re-tir plus vif en rafale.
+    fn update(&mut self, conditions: bool, delay_ms: u32, fast_head: bool) {
+        const HOLD_MS: u128 = 18;
+        const COOLDOWN_MS: u128 = 20;
+        const FAST_HEAD_FACTOR: f32 = 0.4;
         self.armed_visual = conditions;
         loop {
             match self.state {
                 TrigState::Idle => {
                     if conditions {
-                        self.state = TrigState::Armed(Instant::now());
+                        // v0.8 — le délai est TIRÉ à l'armement: chaque cycle
+                        // d'armement a SON temps de réaction propre
+                        let mean = if fast_head {
+                            (delay_ms as f32 * FAST_HEAD_FACTOR).max(0.0)
+                        } else {
+                            delay_ms as f32
+                        };
+                        let drawn = self.rng.delay_around(mean);
+                        self.state = TrigState::Armed(Instant::now(), drawn);
                         continue;
                     }
                     break;
                 }
-                TrigState::Armed(t0) => {
+                TrigState::Armed(t0, drawn) => {
                     if !conditions {
                         self.state = TrigState::Idle;
                         continue;
                     }
-                    if t0.elapsed().as_millis() >= delay_ms as u128 {
+                    if t0.elapsed().as_millis() >= drawn as u128 {
                         send_click(true);
                         self.state = TrigState::Firing(Instant::now());
-                        dlog!("[trig] ENNEMI sous le viseur → clic (délai {delay_ms} ms)");
+                        dlog!("[trig] tir autorisé (gate {:?}) → clic (délai tiré {drawn} ms)",
+                            if fast_head { "TÊTE" } else { "zone" });
                     }
                     break;
                 }
                 TrigState::Firing(t0) => {
-                    if !conditions {
-                        send_click(false); // relâche immédiatement
-                        self.state = TrigState::Idle;
-                        continue;
-                    }
+                    // v0.9.6 — PLUS de release anticipé: le clic est COMMISS.
+                    // Les conditions peuvent bliper un frame (cache d'os
+                    // tick vs frame de rendu) — le down doit rester posé
+                    // jusqu'à ce qu'un usercmd l'ait échantillonné.
                     if t0.elapsed().as_millis() >= HOLD_MS {
                         send_click(false);
                         self.state = TrigState::Cooldown(Instant::now());
@@ -484,7 +660,9 @@ pub(crate) struct Renderer {
     pub(crate) fmt_h: IDWriteTextFormat,    // 16 semibold — logo/titres
     pub(crate) fmt_b: IDWriteTextFormat,    // 13 normal — libellés
     pub(crate) fmt_s: IDWriteTextFormat,    // 11 normal — petits textes
-    pub(crate) fmt_name: IDWriteTextFormat, // 13 semibold — noms joueurs
+    pub(crate) fmt_name: IDWriteTextFormat, // 13 semibold — noms joueurs (moyen)
+    pub(crate) fmt_name_s: IDWriteTextFormat, // 11 semibold — noms ESP petits (v0.4)
+    pub(crate) fmt_name_l: IDWriteTextFormat, // 17 semibold — noms ESP grands (v0.4)
     pub(crate) fmt_mono: IDWriteTextFormat, // 12 Consolas — valeurs/watermark
     pub(crate) font_src: String,            // quelle police est en service
     size: (i32, i32),
@@ -535,10 +713,13 @@ impl Renderer {
                 .CreateSolidColorBrush(&cf([1.0, 1.0, 1.0, 1.0]), None)
                 .map_err(|e| format!("CreateSolidColorBrush: {e}"))?;
 
-            // dégradé accent (mint → azur)
+            // dégradé accent — v0.5: PRIMARY → LIGHT du thème courant.
+            // au boot: thème 0 (Void Purple); run() appelle set_accent() quand
+            // opts.theme change (recréation du brush — le thème est LIVE).
+            let boot_theme = theme::theme(0);
             let stops = [
-                D2D1_GRADIENT_STOP { position: 0.0, color: cf(menu::ACCENT_A) },
-                D2D1_GRADIENT_STOP { position: 1.0, color: cf(menu::ACCENT_B) },
+                D2D1_GRADIENT_STOP { position: 0.0, color: cf(boot_theme.primary) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: cf(boot_theme.light) },
             ];
             let coll: ID2D1GradientStopCollection = rt
                 .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
@@ -616,13 +797,15 @@ impl Renderer {
             let fmt_b = mkf(&dw, 13.0, DWRITE_FONT_WEIGHT_NORMAL, "Space Grotesk")?;
             let fmt_s = mkf(&dw, 11.0, DWRITE_FONT_WEIGHT_NORMAL, "Space Grotesk")?;
             let fmt_name = mkf(&dw, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, "Space Grotesk")?;
+            let fmt_name_s = mkf(&dw, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, "Space Grotesk")?;
+            let fmt_name_l = mkf(&dw, 17.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, "Space Grotesk")?;
             let fmt_mono = mkf(&dw, 12.0, DWRITE_FONT_WEIGHT_NORMAL, "Consolas")?;
 
             dlog!("[*] Direct2D prêt — {w}×{h}, alpha prémultiplié + ULW (verre réel) · police: {font_src}");
 
             Ok(Renderer {
                 hwnd, rt, brush, grad, sheen, memdc, dib, dw,
-                fmt_h, fmt_b, fmt_s, fmt_name, fmt_mono,
+                fmt_h, fmt_b, fmt_s, fmt_name, fmt_name_s, fmt_name_l, fmt_mono,
                 font_src: font_src.clone(),
                 size: (w, h),
             })
@@ -632,6 +815,26 @@ impl Renderer {
     // ═══ primitives de dessin (menu + ESP) — couleurs [r,g,b,a] ═══════════
     fn set_color(&self, c: [f32; 4]) {
         unsafe { self.brush.SetColor(&cf(c)); }
+    }
+
+    /// v0.5 — recrée le brush dégradé accent aux couleurs du thème.
+    /// appelé par run() au changement de thème (live switch).
+    pub(crate) fn set_accent(&mut self, a: [f32; 4], b: [f32; 4]) {
+        unsafe {
+            let stops = [
+                D2D1_GRADIENT_STOP { position: 0.0, color: cf(a) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: cf(b) },
+            ];
+            if let Ok(coll) = self.rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) {
+                let gp = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: D2D_POINT_2F { x: 0.0, y: 0.0 },
+                    endPoint: D2D_POINT_2F { x: 100.0, y: 0.0 },
+                };
+                if let Ok(grad) = self.rt.CreateLinearGradientBrush(&gp, None, &coll) {
+                    self.grad = grad;
+                }
+            }
+        }
     }
 
     pub(crate) fn fill(&self, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]) {
@@ -689,6 +892,17 @@ impl Renderer {
             self.grad.SetEndPoint(D2D_POINT_2F { x: x + w.max(1.0), y: 0.0 });
             let rr = D2D1_ROUNDED_RECT { rect: rect(x, y, w, h), radiusX: rad, radiusY: rad };
             self.rt.FillRoundedRectangle(&rr, &self.grad);
+        }
+    }
+
+    /// v0.6 — BANDE DE LUMIÈRE dégradée (balayage de la barre de titre):
+    /// le brush accent est orienté en diagonale puis rempli en rectangle.
+    pub(crate) fn grad_band(&self, x: f32, y: f32, w: f32, h: f32, opacity: f32) {
+        unsafe {
+            self.grad.SetOpacity(opacity);
+            self.grad.SetStartPoint(D2D_POINT_2F { x, y });
+            self.grad.SetEndPoint(D2D_POINT_2F { x: x + w, y: y + h });
+            self.rt.FillRectangle(&rect(x, y, w, h), &self.grad);
         }
     }
 
@@ -882,6 +1096,9 @@ impl Renderer {
         sh: i32,
         dt: f32,
         suppress: bool,
+        world: &world::WorldState,
+        sound: &modules::SoundEsp,
+        bomb: &modules::BombTimer,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         unsafe {
@@ -910,16 +1127,93 @@ impl Renderer {
             // ── indicateur triggerbot: anneau autour du centre quand ARMÉ ──
             if opts.trigger && st.trigger_armed && !suppress {
                 let (cx, cy) = (swf * 0.5, shf * 0.5);
-                let a = menu::ACCENT_A;
+                let a = theme::resolve(opts.theme, &opts.custom).primary;
                 self.ring(cx, cy, 11.0, [a[0], a[1], a[2], 0.55], 1.6);
                 self.ring(cx, cy, 15.0, [a[0], a[1], a[2], 0.22], 1.0);
             }
 
+            // ── cercle FOV aimbot (v0.6.2 — correspond au VRAI cône de la gate) ──
+            // la gate filtre sur la distance ANGULAIRE hypot(dyaw, dpitch); en
+            // espace écran gnomonique un écart θ du centre tombe à
+            // r = (h/2)·tan(θ)/tan(vfov/2) — l'ancienne règle linéaire
+            // θ·shf/74 dessinait un cercle ~16% TROP GRAND: des têtes
+            // "dans le cercle" ne lockaient pas (gate: hors cône).
+            // v0.9.1 — RENDU RENFORCÉ (le retour "y a plus le cercle"): halo
+            // + trait net à 0.55 d'alpha sur la couleur PRIMARY (le "light"
+            // à 0.26 se perdait sur les maps sombres) + 4 ticks cardinaux —
+            // le cercle reste lisible sur n'importe quel fond.
+            if opts.aim && opts.aim_fov_circle && !suppress {
+                let (cx, cy) = (swf * 0.5, shf * 0.5);
+                let vfov_half = (74.0_f32 / 2.0).to_radians().tan(); // FOV vertical 16:9 ≈ 74°
+                let r = ((shf * 0.5) * opts.aim_fov.to_radians().tan() / vfov_half)
+                    .clamp(8.0, shf * 0.5);
+                let a = theme::resolve(opts.theme, &opts.custom).primary;
+                self.ring(cx, cy, r, [a[0], a[1], a[2], 0.12], 4.0); // halo
+                self.ring(cx, cy, r, [a[0], a[1], a[2], 0.55], 1.5); // trait net
+                for (dx, dy) in [(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)] {
+                    self.line(
+                        cx + dx * (r - 4.0),
+                        cy + dy * (r - 4.0),
+                        cx + dx * (r + 4.0),
+                        cy + dy * (r + 4.0),
+                        [a[0], a[1], a[2], 0.85],
+                        1.5,
+                    );
+                }
+            }
+
+            // ── v0.9.1 — VISUELS DE VISÉE: LA TÊTE QUE L'AIMBOT VISE ──
+            // marqueur tête (halo + anneau + croix) · ligne viseur→tête ·
+            // point PRÉDIT cyan (où la balle partira vraiment — l'écart au
+            // marqueur EST le lead, visible quand la cible strafe) ·
+            // étiquette cible + distance. Données monde de aimbot.aim_point
+            // / pred_point, projetées avec la matrice du frame de rendu.
+            if opts.aim && opts.aim_fov_circle && !suppress {
+                if let Some(s) = snap.filter(|s| s.matrix_ok) {
+                    if let Some((raw, prd)) = st.aim_vis.zip(st.aim_vis_pred) {
+                        let to_v = |t: (f32, f32, f32)| Vec3 { x: t.0, y: t.1, z: t.2 };
+                        if let Some((hx, hy)) = s.matrix.w2s(to_v(raw), swf, shf) {
+                            let th = theme::resolve(opts.theme, &opts.custom);
+                            let (ac, lc) = (th.primary, th.light);
+                            // ligne viseur → tête visée
+                            self.line(swf * 0.5, shf * 0.5, hx, hy, [ac[0], ac[1], ac[2], 0.40], 1.0);
+                            // marqueur tête
+                            self.ring(hx, hy, 9.0, [ac[0], ac[1], ac[2], 0.30], 4.5);
+                            self.ring(hx, hy, 9.0, [lc[0], lc[1], lc[2], 0.95], 1.6);
+                            self.line(hx - 4.0, hy, hx + 4.0, hy, [lc[0], lc[1], lc[2], 0.95], 1.0);
+                            self.line(hx, hy - 4.0, hx, hy + 4.0, [lc[0], lc[1], lc[2], 0.95], 1.0);
+                            // point PRÉDIT (lead): la balle partira LÀ
+                            if let Some((px, py)) = s.matrix.w2s(to_v(prd), swf, shf) {
+                                if (px - hx).abs() > 2.0 || (py - hy).abs() > 2.0 {
+                                    self.line(hx, hy, px, py, [lc[0], lc[1], lc[2], 0.55], 1.0);
+                                    self.dot(px, py, 2.2, [0.20, 0.90, 1.00, 0.95]);
+                                    self.ring(px, py, 5.5, [0.20, 0.90, 1.00, 0.40], 1.0);
+                                }
+                            }
+                            // étiquette: "nom · X m" (remplie seulement en lock)
+                            self.text(&st.aim_target, &self.fmt_s, hx - 70.0, hy + 14.0, 140.0, 14.0, [lc[0], lc[1], lc[2], 0.92], Align::C, true);
+                        }
+                    }
+                }
+            }
+
             // ── boîtes + squelette (asservi aux options du menu) ──
+            // v0.8 — INTERPOLATION DE RENDU: le serveur tick à 64 Hz vu à
+            // ~166 fps fait avancer les boîtes PAR PAS (le saccade restant).
+            // Côté dessin UNIQUEMENT: position affichée = origin +
+            // velocity·(âge du snapshot) — le rendu glisse entre deux ticks.
+            // La logique de tir (trigger/aim) reste sur les positions BRUTES.
+            // Lag > 500 ms (process chargé): on fige (pas de téléport visuel).
             if let Some(snap) = snap {
+                let snap_age = snap.taken_at.elapsed().as_secs_f32();
+                let interp = snap_age <= 0.5;
+                let iage = if interp { snap_age } else { 0.0 };
                 if opts.esp && snap.matrix_ok && !suppress {
                     let pal = &PALETTES[opts.palette];
                     for p in &snap.players {
+                        if !p.alive {
+                            continue; // v0.5: les morts restent dans la liste (spectateurs)
+                        }
                         if p.team != 2 && p.team != 3 {
                             continue; // spectateur / non-assigné
                         }
@@ -930,14 +1224,22 @@ impl Renderer {
                         if !opts.unlimited_dist && dist_m > opts.max_dist_m {
                             continue; // filtre distance (désactivable = illimité)
                         }
-                        let feet = snap.matrix.w2s(p.origin, swf, shf);
-                        let head = snap.matrix.w2s(p.origin.z_up(PLAYER_HEIGHT), swf, shf);
+                        // v0.8 — position INTERPOLÉE pour le rendu (origin +
+                        // velocity·âge): les boîtes glissent au lieu de sauter
+                        let porigin = p.origin.add_scaled(&p.velocity, iage);
+                        let feet = snap.matrix.w2s(porigin, swf, shf);
+                        let head = snap.matrix.w2s(porigin.z_up(PLAYER_HEIGHT), swf, shf);
                         let (Some((fx, fy)), Some((hx, hy))) = (feet, head) else { continue };
                         let bh = fy - hy;
-                        if !(24.0..=800.0).contains(&bh) {
+                        // v0.4 — FIX 40 m: l'ancien plancher 24 px coupait TOUT
+                        // (boîte, nom, distance, squelette) dès que le joueur
+                        // projetait sous 24 px — à 1080p ça tombe à ~40 m
+                        // (72 u / 2·tan(37°) ≈ 24,6 px). Plancher 6 px: le ESP
+                        // reste affiché loin, les éléments restent lisibles.
+                        if !(6.0..=2000.0).contains(&bh) {
                             continue;
                         }
-                        let bw = (bh * 0.45).clamp(16.0, 240.0);
+                        let bw = (bh * 0.45).clamp(10.0, 240.0);
                         let bcx = (fx + hx) * 0.5;
                         let is_local = p.pawn == snap.local_pawn;
                         let border = if is_local { pal.me } else if p.team == 2 { pal.t } else { pal.ct };
@@ -954,7 +1256,7 @@ impl Renderer {
                         }
                         match opts.box_mode {
                             0 => {
-                                let l = (bh * 0.28).clamp(7.0, 16.0);
+                                let l = (bh * 0.28).clamp(5.0, 16.0);
                                 let ac = mix4(border, [1.0, 1.0, 1.0, 1.0], 0.35);
                                 self.line(bx, by, bx + l, by, ac, 2.6);
                                 self.line(bx, by, bx, by + l, ac, 2.6);
@@ -969,22 +1271,73 @@ impl Renderer {
                             _ => {}
                         }
 
-                        // ── SQUELETTE: 17 segments os par os (cache 0x20) ──
-                        // couleur = teinte d'équipe éclaircie, tête en point.
+                        // ── SQUELETTE v0.4: os reliés + articulations ──
+                        // épaisseur asservie à la taille projetée (lisible de
+                        // loin sans être gros en close-up) + points aux
+                        // articulations pour que la pose se LISE visuellement.
                         if opts.skeleton && !is_local {
                             if let Some(bones) = &p.bones {
                                 let sk = mix4(border, [1.0, 1.0, 1.0, 1.0], 0.28);
                                 let skc = [sk[0], sk[1], sk[2], 0.95];
+                                let lw = (bh * 0.028).clamp(1.0, 3.0);
                                 for (a, b) in BONE_CONNECTS {
                                     if let (Some(ba), Some(bb)) = (
-                                        bones.get(a).and_then(|p| snap.matrix.w2s(*p, swf, shf)),
-                                        bones.get(b).and_then(|p| snap.matrix.w2s(*p, swf, shf)),
+                                        bones.get(a).map(|v| v.add_scaled(&p.velocity, iage)).and_then(|p| snap.matrix.w2s(p, swf, shf)),
+                                        bones.get(b).map(|v| v.add_scaled(&p.velocity, iage)).and_then(|p| snap.matrix.w2s(p, swf, shf)),
                                     ) {
-                                        self.line(ba.0, ba.1, bb.0, bb.1, skc, 1.7);
+                                        self.line(ba.0, ba.1, bb.0, bb.1, skc, lw);
                                     }
                                 }
-                                if let Some(h) = bones.get(B_HEAD).and_then(|p| snap.matrix.w2s(*p, swf, shf)) {
-                                    self.dot(h.0, h.1, 2.3, skc);
+                                for j in JOINT_BONES {
+                                    if let Some(pt) = bones.get(j).map(|v| v.add_scaled(&p.velocity, iage)).and_then(|p| snap.matrix.w2s(p, swf, shf)) {
+                                        self.dot(pt.0, pt.1, lw * 0.62, skc);
+                                    }
+                                }
+                                if let Some(h) = bones.get(B_HEAD).map(|v| v.add_scaled(&p.velocity, iage)).and_then(|p| snap.matrix.w2s(p, swf, shf)) {
+                                    self.dot(h.0, h.1, lw * 0.85, skc);
+                                }
+                            }
+                        }
+
+                        // ── HITBOX v0.5: zones de collision calibrées sur les os ──
+                        // tête = cercle (rayon ∝ hauteur projetée), poitrine =
+                        // rect épaules, corps = rect bassin→poitrine, membres =
+                        // segments épaissis. Code couleur fonctionnel fixe.
+                        if opts.hitbox && !is_local {
+                            if let Some(bones) = &p.bones {
+                                let head_r = (bh * 0.075).clamp(3.0, 14.0);
+                                let lw_hb = (bh * 0.028).clamp(1.0, 3.0); // même échelle que le squelette
+                                // v0.8 — os interpolés (cohérence avec les boîtes)
+                                let ob = |i: usize| bones.get(i).map(|v| v.add_scaled(&p.velocity, iage));
+                                if let Some(h) = ob(B_HEAD).and_then(|b| snap.matrix.w2s(b, swf, shf)) {
+                                    self.ring(h.0, h.1, head_r, [1.00, 0.28, 0.32, 0.85], 1.4);
+                                    self.dot(h.0, h.1, head_r * 0.22, [1.00, 0.28, 0.32, 0.9]);
+                                }
+                                // poitrine: rect entre les épaules (9..13)
+                                if let (Some(l), Some(rc)) = (
+                                    ob(9).and_then(|b| snap.matrix.w2s(b, swf, shf)),
+                                    ob(13).and_then(|b| snap.matrix.w2s(b, swf, shf)),
+                                ) {
+                                    let cw2 = (l.0 - rc.0).abs().max(head_r * 1.6);
+                                    let cyh = (l.1 + rc.1) * 0.5;
+                                    self.stroke(l.0.max(rc.0) - cw2, cyh - cw2 * 0.35, cw2, cw2 * 0.7, [1.00, 0.60, 0.20, 0.55], 1.2);
+                                }
+                                // corps: rect bassin→poitrine
+                                if let (Some(pv), Some(ch)) = (
+                                    ob(1).and_then(|b| snap.matrix.w2s(b, swf, shf)),
+                                    ob(23).and_then(|b| snap.matrix.w2s(b, swf, shf)),
+                                ) {
+                                    let bwid = (bh * 0.16).clamp(6.0, 42.0);
+                                    self.stroke(((pv.0 + ch.0) * 0.5) - bwid * 0.5, ch.1, bwid, (pv.1 - ch.1).abs().max(4.0), [1.00, 0.90, 0.30, 0.45], 1.2);
+                                }
+                                // membres: segments épaissis bleus
+                                for (a, b) in [(9, 10), (10, 11), (13, 14), (14, 15), (17, 18), (18, 19), (20, 21), (21, 22)] {
+                                    if let (Some(ba), Some(bb)) = (
+                                        ob(a).and_then(|b| snap.matrix.w2s(b, swf, shf)),
+                                        ob(b).and_then(|b| snap.matrix.w2s(b, swf, shf)),
+                                    ) {
+                                        self.line(ba.0, ba.1, bb.0, bb.1, [0.35, 0.65, 1.00, 0.45], lw_hb * 1.9);
+                                    }
                                 }
                             }
                         }
@@ -1000,15 +1353,21 @@ impl Renderer {
                         }
 
                         // pastille nom (mesurée DWrite — centrage exact)
+                        // v0.4: taille petit/moyen/grand au choix (onglet ESP)
                         if opts.names {
+                            let fmt = match opts.esp_text_size {
+                                0 => &self.fmt_name_s,
+                                2 => &self.fmt_name_l,
+                                _ => &self.fmt_name,
+                            };
                             let name = if is_local { format!("{} (toi)", p.name) } else { p.name.clone() };
-                            let (nw, nh) = self.measure(&name, &self.fmt_name);
+                            let (nw, nh) = self.measure(&name, fmt);
                             let pw = nw + 14.0;
                             let ph = nh + 7.0;
                             let px = bcx - pw * 0.5;
                             let py = by - ph - 5.0;
                             self.fill_round(px, py, pw, ph, 6.0, [0.04, 0.05, 0.07, 0.62]);
-                            self.text(&name, &self.fmt_name, px, py, pw, ph, [0.94, 0.96, 0.98, 0.97], Align::C, true);
+                            self.text(&name, fmt, px, py, pw, ph, [0.94, 0.96, 0.98, 0.97], Align::C, true);
                         }
 
                         // pastille distance
@@ -1031,23 +1390,140 @@ impl Renderer {
 
                 // ── RADAR / MINIMAP (rotation caméra via la matrice de vue) ──
                 if opts.radar && snap.matrix_ok && snap.local_alive && !suppress {
-                    self.draw_radar(snap, opts, sw, sh);
+                    self.draw_radar(snap, opts, sw, sh, sound);
+                }
+
+                // ── v0.5: ESP MONDE — armes au sol ──
+                if opts.weapon_esp && snap.matrix_ok && !suppress {
+                    let t = theme::resolve(opts.theme, &opts.custom);
+                    let dimc = theme::dim(&t);
+                    for w in &world.items {
+                        let dist_m = w.pos.dist(&snap.local_origin) * 0.019;
+                        if !opts.unlimited_dist && dist_m > opts.max_dist_m {
+                            continue;
+                        }
+                        // petit losange au sol + label + distance
+                        let Some((wx, wy)) = snap.matrix.w2s(w.pos.z_up(3.0), swf, shf) else { continue };
+                        let s = 5.0;
+                        self.line(wx, wy - s, wx + s, wy, [t.primary[0], t.primary[1], t.primary[2], 0.85], 1.6);
+                        self.line(wx + s, wy, wx, wy + s, [t.primary[0], t.primary[1], t.primary[2], 0.85], 1.6);
+                        self.line(wx, wy + s, wx - s, wy, [t.primary[0], t.primary[1], t.primary[2], 0.85], 1.6);
+                        self.line(wx - s, wy, wx, wy - s, [t.primary[0], t.primary[1], t.primary[2], 0.85], 1.6);
+                        let label = format!("{} · {:.0}m", w.name, dist_m);
+                        let (tw2, th2) = self.measure(&label, &self.fmt_s);
+                        let px = wx - (tw2 + 10.0) * 0.5;
+                        let py = wy + 8.0;
+                        self.fill_round(px, py, tw2 + 10.0, th2 + 5.0, 5.0, [t.bg[0], t.bg[1], t.bg[2], 0.55]);
+                        self.text(&label, &self.fmt_s, px, py, tw2 + 10.0, th2 + 5.0, [dimc[0], dimc[1], dimc[2], 0.95], Align::C, true);
+                    }
+                }
+
+                // ── v0.5: GRENADE TRAILS — polylignes + tête lumineuse ──
+                if opts.grenade_trails && snap.matrix_ok && !suppress {
+                    for p in &world.projectiles {
+                        let col = p.kind.color();
+                        let fade = match p.dead_since {
+                            Some(at) => 1.0 - (at.elapsed().as_secs_f32() / 3.5).min(1.0),
+                            None => 1.0,
+                        };
+                        if fade <= 0.0 {
+                            continue;
+                        }
+                        // traîne: du plus vieux au plus récent, alpha croissant
+                        let n = p.trail.len();
+                        for i in 1..n {
+                            let (pa, _) = p.trail[i - 1];
+                            let (pb, _) = p.trail[i];
+                            let a = (i as f32 / n as f32) * 0.75 * fade;
+                            if let (Some(sa), Some(sb)) = (
+                                snap.matrix.w2s(pa, swf, shf),
+                                snap.matrix.w2s(pb, swf, shf),
+                            ) {
+                                self.line(sa.0, sa.1, sb.0, sb.1, [col[0], col[1], col[2], a], 1.6);
+                            }
+                        }
+                        // tête + label
+                        if let Some((hx2, hy2)) = snap.matrix.w2s(p.last_pos, swf, shf) {
+                            self.dot(hx2, hy2, 3.2, [col[0], col[1], col[2], fade]);
+                            self.ring(hx2, hy2, 6.0, [col[0], col[1], col[2], 0.5 * fade], 1.2);
+                            let (tw2, th2) = self.measure(p.kind.label(), &self.fmt_s);
+                            self.fill_round(hx2 + 8.0, hy2 - th2 * 0.5 - 3.0, tw2 + 8.0, th2 + 6.0, 4.0, [0.03, 0.03, 0.05, 0.5 * fade]);
+                            self.text(p.kind.label(), &self.fmt_s, hx2 + 8.0, hy2 - th2 * 0.5 - 3.0, tw2 + 8.0, th2 + 6.0, [col[0], col[1], col[2], fade], Align::L, true);
+                        }
+                    }
+                }
+
+                // ── v0.5: SOUND ESP — anneaux de pas à la position monde ──
+                if opts.sound_esp && snap.matrix_ok && !suppress {
+                    let pal = &PALETTES[opts.palette];
+                    for e in &sound.events {
+                        let age = sound.age01(e);
+                        let Some((ex, ey)) = snap.matrix.w2s(e.pos, swf, shf) else { continue };
+                        let radius = 5.0 + age * 34.0;
+                        let alpha = (1.0 - age) * 0.5;
+                        let col = if e.team == 2 { pal.t } else { pal.ct };
+                        self.ring(ex, ey, radius, [col[0], col[1], col[2], alpha], 1.4);
+                        self.dot(ex, ey, 1.8, [col[0], col[1], col[2], alpha]);
+                    }
+                }
+
+                // ── v0.5: BOMB TIMER — bandeau haut centre ──
+                if opts.bomb_timer && !suppress {
+                    self.draw_bomb_banner(snap, bomb, swf, dt);
+                }
+
+                // ── v0.6.1: ESP BOMBE — marqueur monde sur le C4 plantée ──
+                if opts.bomb_esp && snap.matrix_ok && !suppress {
+                    self.draw_bomb_esp(snap, bomb, swf, shf);
+                }
+
+                // ── v0.5: SPECTATEURS — coin bas-droite discret ──
+                if opts.spectators && !suppress && !snap.spectators.is_empty() {
+                    let t = theme::resolve(opts.theme, &opts.custom);
+                    let mut lines: Vec<String> = vec![format!("SPECTATEURS · {}", snap.spectators.len())];
+                    lines.extend(snap.spectators.iter().cloned());
+                    let lh = 17.0;
+                    let bw = 170.0f32;
+                    let bh = lh * lines.len() as f32 + 12.0;
+                    let bx2 = swf - bw - 12.0;
+                    let by2 = shf - bh - 12.0;
+                    self.fill_round(bx2, by2, bw, bh, 8.0, [t.bg[0], t.bg[1], t.bg[2], 0.62]);
+                    self.stroke_round(bx2, by2, bw, bh, 8.0, [t.border[0], t.border[1], t.border[2], t.border[3] * 1.6], 1.0);
+                    for (i, line) in lines.iter().enumerate() {
+                        let c = if i == 0 {
+                            [t.light[0], t.light[1], t.light[2], 0.9]
+                        } else {
+                            [t.text[0], t.text[1], t.text[2], 0.75]
+                        };
+                        // œil: point + arc pour la première ligne
+                        if i == 0 {
+                            self.dot(bx2 + 14.0, by2 + 6.0 + lh * 0.5, 2.2, c);
+                            self.ring(bx2 + 14.0, by2 + 6.0 + lh * 0.5, 4.4, [c[0], c[1], c[2], 0.55], 1.0);
+                        }
+                        self.text(line, &self.fmt_s, bx2 + (if i == 0 { 26.0 } else { 16.0 }), by2 + 6.0 + i as f32 * lh, bw - 20.0, lh, c, Align::L, true);
+                    }
+                }
+
+                // ── v0.5: ACCURACY LAB — coin haut-gauche sous le watermark ──
+                if opts.accuracy && !suppress {
+                    self.draw_accuracy(st, swf);
                 }
             }
 
-            // ── watermark (pill glass) ──
+            // ── watermark (pill glass) — Vantyx.cc, couleurs du thème ──
             if opts.watermark {
+                let t = theme::resolve(opts.theme, &opts.custom);
                 let wm = format!(
-                    "cs2-esp v0.3.0 │ {:>3.0} fps │ {} joueurs │ INSERT menu",
+                    "Vantyx.cc v0.9.4 │ {:>3.0} fps │ {} joueurs │ INSERT menu",
                     fps,
-                    snap.map(|s| s.players.len()).unwrap_or(0)
+                    snap.map(|s| s.players.iter().filter(|p| p.alive).count()).unwrap_or(0)
                 );
                 let (tw, th) = self.measure(&wm, &self.fmt_mono);
                 let pw = tw + 20.0;
                 let ph = th + 10.0;
-                self.fill_round(10.0, 10.0, pw, ph, ph * 0.5, [0.05, 0.06, 0.085, 0.55]);
-                self.stroke_round(10.0, 10.0, pw, ph, ph * 0.5, [1.0, 1.0, 1.0, 0.12], 1.0);
-                self.text(&wm, &self.fmt_mono, 10.0, 10.0, pw, ph, [0.72, 0.86, 0.83, 0.92], Align::C, true);
+                self.fill_round(10.0, 10.0, pw, ph, ph * 0.5, [t.bg[0], t.bg[1], t.bg[2], 0.55]);
+                self.stroke_round(10.0, 10.0, pw, ph, ph * 0.5, [t.border[0], t.border[1], t.border[2], t.border[3] * 1.6], 1.0);
+                self.text(&wm, &self.fmt_mono, 10.0, 10.0, pw, ph, [t.light[0], t.light[1], t.light[2], 0.92], Align::C, true);
             }
 
             // ── menu glass (dessin + interaction immédiate) ──
@@ -1091,8 +1567,13 @@ impl Renderer {
     /// RADAR: panneau verre, points par équipe, flèche locale au centre,
     /// rotation = ta vue (base prise sur la ligne 0 de la matrice caméra:
     /// (m0,m1) = droite 2D, (-m1,m0) = devant 2D — même maths que le w2s).
-    fn draw_radar(&self, snap: &Snapshot, opts: &Options, sw: i32, sh: i32) {
+    /// v0.5: fond/bordures du THÈME + anneaux des pas (sound ESP) en 2D.
+    fn draw_radar(&self, snap: &Snapshot, opts: &Options, sw: i32, sh: i32, sound: &modules::SoundEsp) {
         let pal = &PALETTES[opts.palette];
+        let t = theme::resolve(opts.theme, &opts.custom);
+        // v0.8 — interpolation radar: même âge de snapshot que l'ESP principal
+        let snap_age = snap.taken_at.elapsed().as_secs_f32();
+        let iage = if snap_age <= 0.5 { snap_age } else { 0.0 };
         let size = opts.radar_size.clamp(120.0, 400.0);
         let margin = 12.0f32;
         let (px, py) = match opts.radar_corner {
@@ -1103,9 +1584,9 @@ impl Renderer {
         };
         let (cx, cy, half) = (px + size * 0.5, py + size * 0.5, size * 0.5);
 
-        // fond verre + bordure
-        self.fill_round(px, py, size, size, 12.0, [0.03, 0.04, 0.06, 0.55]);
-        self.stroke_round(px, py, size, size, 12.0, [1.0, 1.0, 1.0, 0.10], 1.0);
+        // fond verre + bordure — thème
+        self.fill_round(px, py, size, size, 12.0, [t.bg[0], t.bg[1], t.bg[2], 0.55]);
+        self.stroke_round(px, py, size, size, 12.0, [t.border[0], t.border[1], t.border[2], t.border[3] * 1.6], 1.0);
         // anneaux de distance + croix
         self.ring(cx, cy, half * 0.33, [1.0, 1.0, 1.0, 0.05], 1.0);
         self.ring(cx, cy, half * 0.66, [1.0, 1.0, 1.0, 0.05], 1.0);
@@ -1120,15 +1601,40 @@ impl Renderer {
         let range = opts.radar_range.max(100.0);
         let reach = half - 9.0;
 
+        // ── v0.5: SOUND ESP sur le radar (toujours visibles, même hors écran) ──
+        if opts.sound_esp {
+            for e in &sound.events {
+                let age = sound.age01(e);
+                let (dx, dy) = (e.pos.x - snap.local_origin.x, e.pos.y - snap.local_origin.y);
+                let mut nx = dx / range;
+                let mut ny = dy / range;
+                let dnorm = (nx * nx + ny * ny).sqrt();
+                if dnorm > 1.0 {
+                    let s = 1.0 / dnorm.max(1e-6);
+                    nx *= s;
+                    ny *= s;
+                }
+                let rad_x = nx * rx + ny * ry;
+                let rad_y = nx * fx + ny * fy;
+                let ex = cx + rad_x * reach;
+                let ey = cy - rad_y * reach;
+                let alpha = (1.0 - age) * 0.55;
+                self.ring(ex, ey, 3.0 + age * 12.0, [t.light[0], t.light[1], t.light[2], alpha], 1.2);
+            }
+        }
+
         for p in &snap.players {
-            if (p.team != 2 && p.team != 3) || p.pawn == snap.local_pawn {
+            if !p.alive || (p.team != 2 && p.team != 3) || p.pawn == snap.local_pawn {
                 continue;
             }
             let mate = p.team == snap.local_team;
             if mate && !opts.radar_mates {
                 continue;
             }
-            let (dx, dy) = (p.origin.x - snap.local_origin.x, p.origin.y - snap.local_origin.y);
+            let (dx, dy) = (
+                p.origin.x + p.velocity.x * iage - snap.local_origin.x,
+                p.origin.y + p.velocity.y * iage - snap.local_origin.y,
+            );
             let mut nx = dx / range;
             let mut ny = dy / range;
             let dnorm = (nx * nx + ny * ny).sqrt();
@@ -1163,14 +1669,126 @@ impl Renderer {
         self.line(cx - 5.5, cy + 6.0, cx + 5.5, cy + 6.0, lf, 1.4);
 
         // étiquettes
-        self.text("RADAR", &self.fmt_s, px + 10.0, py + 6.0, 70.0, 14.0, [0.60, 0.65, 0.72, 0.8], Align::L, false);
+        let dimc = theme::dim(&t);
+        self.text("RADAR", &self.fmt_s, px + 10.0, py + 6.0, 70.0, 14.0, [dimc[0], dimc[1], dimc[2], 0.8], Align::L, false);
         let rs = format!("{:.0} u", range);
-        self.text(&rs, &self.fmt_s, px + size - 80.0, py + 6.0, 70.0, 14.0, [0.60, 0.65, 0.72, 0.8], Align::R, false);
+        self.text(&rs, &self.fmt_s, px + size - 80.0, py + 6.0, 70.0, 14.0, [dimc[0], dimc[1], dimc[2], 0.8], Align::R, false);
+    }
+
+    /// v0.5 — BOMB TIMER: bandeau haut centre (temps + barre + état defuse).
+    /// Pulse rouge sous 10 s; barre de désamorçage en surimpression bleue.
+    fn draw_bomb_banner(&self, snap: &Snapshot, bomb: &modules::BombTimer, swf: f32, dt: f32) {
+        if !bomb.planted || bomb.defused {
+            return;
+        }
+        let bw = 240.0f32;
+        let bh = 46.0f32;
+        let bx = swf * 0.5 - bw * 0.5;
+        let by = 56.0f32;
+        // pulse sous 10 s — v0.6.1: horloge RÉELLE (l'ancien
+        // Instant::now().elapsed() valait ~0 à chaque frame → figé)
+        let pulse = if bomb.remaining_s < 10.0 {
+            0.5 + 0.5 * (bomb_phase() * 6.0).sin()
+        } else {
+            0.0
+        };
+        let danger = if bomb.remaining_s < 10.0 { 0.55 + 0.35 * pulse } else { 0.35 };
+        self.fill_round(bx, by, bw, bh, 10.0, [0.10, 0.02, 0.03, 0.72]);
+        self.stroke_round(bx, by, bw, bh, 10.0, [1.0, 0.20, 0.28, danger], 1.4);
+        // temps restant, grand, mono
+        let ts = format!("{:.1}s", bomb.remaining_s);
+        let (tw2, _) = self.measure(ts.trim(), &self.fmt_mono);
+        self.text(ts.trim(), &self.fmt_mono, bx + 14.0, by + 5.0, tw2 + 6.0, bh - 10.0, [1.0, 0.45 + 0.35 * pulse, 0.42, 0.95], Align::L, true);
+        // barre de mèche
+        let frac = (bomb.remaining_s / bomb.timer_length.max(1.0)).clamp(0.0, 1.0);
+        let bar_y = by + bh - 12.0;
+        self.fill_round(bx + 14.0, bar_y, bw - 28.0, 5.0, 2.5, [1.0, 1.0, 1.0, 0.10]);
+        self.fill_round(bx + 14.0, bar_y, (bw - 28.0) * frac, 5.0, 2.5, [1.0, 0.28, 0.34, 0.9]);
+        // état defuse
+        let label = if bomb.defusing {
+            format!("DÉSAMORÇAGE · {:.1}s", bomb.defuse_remaining_s)
+        } else {
+            format!("à {:.0} m", bomb.dist_m(&snap.local_origin))
+        };
+        let (lw2, _) = self.measure(&label, &self.fmt_s);
+        self.text(&label, &self.fmt_s, bx + bw - lw2 - 14.0, by + 5.0, lw2 + 4.0, 20.0, if bomb.defusing { [0.45, 0.78, 1.0, 0.95] } else { [0.85, 0.88, 0.92, 0.8] }, Align::R, true);
+        // barre defuse en surimpression
+        if bomb.defusing {
+            let dfrac = (bomb.defuse_remaining_s / 10.0).clamp(0.0, 1.0);
+            self.fill_round(bx + 14.0, bar_y - 5.0, (bw - 28.0) * (1.0 - dfrac), 3.0, 1.5, [0.45, 0.78, 1.0, 0.85]);
+        }
+        let _ = dt;
+    }
+
+    /// v0.6.1 — ESP BOMBE: marqueur monde pulsant sur le C4 plantée.
+    /// Losange rouge (rayon d'alerte croissant sous 10 s) + pastille
+    /// "C4 · temps restant · distance" — état DÉSAMORÇAGE en bleu quand
+    /// quelqu'un est en train de couper. Toggle: MISC → BOMBE & SPECTATEURS.
+    fn draw_bomb_esp(&self, snap: &Snapshot, bomb: &modules::BombTimer, swf: f32, shf: f32) {
+        if !bomb.planted || bomb.defused || !bomb.pos.x.is_finite() {
+            return;
+        }
+        let Some((bx, by)) = snap.matrix.w2s(bomb.pos.z_up(8.0), swf, shf) else { return };
+        let danger = bomb.remaining_s < 10.0;
+        let pulse = 0.5 + 0.5 * (bomb_phase() * if danger { 6.0 } else { 2.0 }).sin();
+        let alpha = if danger { 0.62 + 0.38 * pulse } else { 0.50 + 0.18 * pulse };
+        let col = [1.00, 0.22, 0.28, alpha];
+        // losange rouge sur le point de plantation
+        let s = 9.0f32;
+        let w = s * 0.62;
+        self.line(bx, by - s, bx + w, by, col, 2.4);
+        self.line(bx + w, by, bx, by + s, col, 2.4);
+        self.line(bx, by + s, bx - w, by, col, 2.4);
+        self.line(bx - w, by, bx, by - s, col, 2.4);
+        self.dot(bx, by, 2.6, col);
+        // rayon d'alerte qui respire — uniquement en zone danger
+        if danger {
+            let ring_a = 0.55 * (1.0 - pulse);
+            self.ring(bx, by, 12.0 + 10.0 * pulse, [1.00, 0.22, 0.28, ring_a], 1.8);
+        }
+        // pastille: C4 · temps restant · distance (defuse → bleu + état)
+        let dist_m = bomb.pos.dist(&snap.local_origin) * 0.019;
+        let label = if bomb.defusing {
+            format!("C4 · DÉSAMORÇAGE {:.1}s", bomb.defuse_remaining_s)
+        } else {
+            format!("C4 · {:.1}s · {:.0} m", bomb.remaining_s, dist_m)
+        };
+        let (tw, th) = self.measure(&label, &self.fmt_s);
+        let pw = tw + 12.0;
+        let ph = th + 6.0;
+        let px = bx - pw * 0.5;
+        let py = by + s + 6.0;
+        self.fill_round(px, py, pw, ph, 5.0, [0.03, 0.02, 0.04, 0.66]);
+        let lc = if bomb.defusing { [0.45, 0.78, 1.00, 0.96] } else { [1.00, 0.45 + 0.35 * pulse, 0.42, 0.96] };
+        self.text(&label, &self.fmt_s, px, py, pw, ph, lc, Align::C, true);
+    }
+
+    /// v0.5 — ACCURACY LAB: panneau stats coin haut-gauche (sous watermark).
+    fn draw_accuracy(&self, st: &StatusInfo, swf: f32) {
+        let t = theme::theme(0);
+        let _ = t;
+        let lines = [
+            format!("ACCURACY LAB — {}", st.acc_weapon),
+            format!("tirs {:<5} hits {:<5} {:.0}%", st.acc_shots, st.acc_hits, if st.acc_shots > 0 { st.acc_hits as f32 / st.acc_shots as f32 * 100.0 } else { 0.0 }),
+            format!("élims {} · {} dégâts", st.acc_kills, st.acc_damage),
+        ];
+        let lh = 16.0f32;
+        let bw = 210.0f32;
+        let bh = lh * lines.len() as f32 + 10.0;
+        let bx = 10.0f32;
+        let by = 38.0f32; // sous le watermark (10 + ~28)
+        let _ = swf;
+        self.fill_round(bx, by, bw, bh, 8.0, [0.03, 0.03, 0.05, 0.60]);
+        self.stroke_round(bx, by, bw, bh, 8.0, [1.0, 1.0, 1.0, 0.10], 1.0);
+        for (i, line) in lines.iter().enumerate() {
+            let c = if i == 0 { [0.85, 0.88, 0.92, 0.9] } else { [0.70, 0.75, 0.80, 0.85] };
+            self.text(line, &self.fmt_mono, bx + 12.0, by + 5.0 + i as f32 * lh, bw - 24.0, lh, c, Align::L, true);
+        }
     }
 }
 
 fn dump_now(mem: &Mem, offs: &Offsets) {
-    match entity::snapshot_full(mem, offs, true, true) {
+    match entity::snapshot_full(mem, offs, true, true, 0) {
         Some(s) => entity::dump_verbose(&s, mem, offs),
         None => debug::emit("[!] dump: pas de snapshot (pas en partie / offsets stale)".into()),
     }
@@ -1216,8 +1834,15 @@ fn r_red_test(renderer: &Option<Renderer>, w: i32, h: i32) -> Option<Vec<Action>
     Some(Vec::new())
 }
 
-pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
-    unsafe { let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); }
+pub fn run(mem: &mut Mem, offs: &Offsets, cfg: Config) -> ExitCode {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // v0.8 — TIMER SYSTÈME À 1 ms: sans ça, Sleep(1) dort 15,625 ms — la
+        // boucle "1 kHz" était en réalité ~64 Hz irrégulier (LE saccage).
+        if timeBeginPeriod(1) == 0 {
+            dlog!("[*] timeBeginPeriod(1) — granularité timer système 1 ms");
+        }
+    }
     let red_test = std::env::var("ESP_RED_TEST").is_ok();
 
     // config: ini d'abord, CLI en override (le menu est la source de vérité
@@ -1270,17 +1895,72 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
     let mut last_draw = Instant::now();
     let mut fps = 0.0f32;
     let mut frame_i: u64 = 0;
-    let (mut k_end, mut k_f1, mut k_f2, mut k_f4, mut k_f8, mut k_ins) = (false, false, false, false, false, false);
+    let (mut k_end, mut k_f1, mut k_f2, mut k_f4, mut k_f8, mut k_ins, mut k_f10) = (false, false, false, false, false, false, false);
     let mut last_menu_open = false; // resync du click-through (INSERT OU croix)
 
     // ── v0.3: visibilité jeu-seulement + triggerbot ──
     let mut overlay_visible = true;
     let mut suppress_logged = false;
     let mut trigger = TriggerBot::new();
+    // v0.9.6 — gate tête du frame courant (consommé par le statut menu):
+    // la balle partant maintenant atterrit-elle dans la tête ?
+    let mut trig_head_ready = false;
+    // ── v0.4: aimbot (visée auto SendInput — cramable, assumé) ──
+    let mut aimbot = aimbot::AimBot::new();
 
-    debug::emit("[*] overlay actif — INSERT: menu glass · END: quitter · F1: debug · F2: coéquipiers · F4: dump".into());
-    debug::emit("[*] ESP limité au jeu: caché si CS2 n'est plus au premier plan (Discord & co), coupé dans les menus/achat".into());
-    debug::emit("[*] triggerbot: maintiens la touche (ALT par défaut) — tir auto sur ennemi sous le viseur".into());
+    // ── v0.5 · Vantyx.cc — les modules ──
+    let mut rcs = modules::Rcs::new();
+    let mut bomb = modules::BombTimer::new();
+    let mut sound = modules::SoundEsp::new();
+    let mut bhop = modules::Bunnyhop::new();
+    let mut lab = modules::AccuracyLab::new();
+    let mut world_state = world::WorldState::new();
+    let mut weapon_name: Option<String> = None;
+
+    // ── v0.7 · RAGE — spinbot (WPM dwViewAngles) / silent aim (one-frame
+    // flick) / no-recoil punch FF. Hiérarchie de priorité sur la vue:
+    // aimbot > silent aim > spinbot — le recul se compense en parallèle. ──
+    let mut spin = modules::Spinbot::new();
+    let mut silent = modules::SilentAim::new();
+    let mut norecoil = modules::NoRecoil::new();
+
+    // ── v0.9 · caméra 3e personne (flag CSGOInput + patch moteur opt-in) ──
+    let mut tp = thirdperson::ThirdPerson::new();
+
+    // ── v0.8 · VOIE B GATED: le handle RW n'existe QUE si rage_mode est ON ──
+    // Transition ON→OFF = close_write immédiat. Le bandeau du menu reflète
+    // l'état réel (mem.write_open()).
+    let mut rage_last = false;
+    if opts.rage_mode {
+        mem.open_write();
+        rage_last = true;
+    }
+
+    // ── v0.8 · TIMER HAUTE RÉSOLUTION pour la boucle (~0,5 ms de précision) ─
+    let hi_wait = HiResWait::new();
+
+    // streamproof: WDA_EXCLUDEFROMCAPTURE dès le boot si coché — l'overlay
+    // devient invisible pour OBS/Discord screen-share/ShadowPlay (fenêtre
+    // noire à leur capture). Live-toggle via le menu (onglet DIVERS).
+    let mut streamproof_on = opts.streamproof;
+    apply_streamproof(hwnd, streamproof_on);
+
+    // thème live: set_accent quand opts.theme OU les couleurs custom changent
+    // (le studio RGB du menu sculpte en direct — le brush suit au pixel)
+    let mut last_theme = opts.theme;
+    let mut last_custom: CustomColors = opts.custom;
+    if let Some(r) = renderer.as_mut() {
+        let t = theme::resolve(last_theme, &last_custom);
+        r.set_accent(t.primary, t.light);
+    }
+
+    debug::emit("[Vantyx.cc v0.9.4] overlay actif — INSERT: menu glass · END: quitter · F1: debug · F2: coéquipiers · F4: dump".into());
+    debug::emit("[ov ] ESP limité au jeu: caché si CS2 n'est plus au premier plan (Discord & co), coupé dans les menus/achat".into());
+    debug::emit("[trig] maintiens la touche (ALT par défaut) — tir auto sur ennemi sous le viseur, zone au choix (onglet TRIGGER)".into());
+    debug::emit("[aim ] v0.5 FIX: vue dwViewAngles + envoi sur vue FRAÎCHE (plus d'overshoot en éventail) + sensibilité lue dans le jeu (dwSensitivity)".into());
+    debug::emit("[rcs ] recul compensé par différentiel de vue — force réglable (onglet OUTILS)".into());
+    debug::emit(format!("[strm] streamproof {} — WDA_EXCLUDEFROMCAPTURE sur l'overlay", if streamproof_on { "ACTIF" } else { "coupé" }));
+    debug::emit("[bomb] timer + defuse · [spec] liste spectateurs · [wrld] armes au sol + trajectoires grenades · [snd] anneaux de pas".into());
     debug::emit("[*] rien ne s'affiche ? → jeu en plein écran SANS BORDURE + overlay visible (2e écran / alt-tab)".into());
     debug::emit(format!("[*] config: {config_disp} — réglages persistés automatiquement"));
     debug::emit(String::new());
@@ -1291,6 +1971,7 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
+                    tp.update(mem, offs, false, false, false, false); // v0.9 — flag 0 + gate restauré
                     menu.save_now(&opts);
                     return ExitCode::UserQuit;
                 }
@@ -1305,6 +1986,7 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
         // touches globales (front descendant — plus de re-trigger si tenu)
         if pressed(VK_END, &mut k_end) {
             debug::emit("[*] END → arrêt".into());
+            tp.update(mem, offs, false, false, false, false); // v0.9 — nettoyage 3e personne
             menu.save_now(&opts);
             return ExitCode::UserQuit;
         }
@@ -1318,6 +2000,12 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
         }
         if pressed(VK_F4, &mut k_f4) {
             dump_now(mem, offs);
+        }
+        // v0.6 — F10: anti screen-share ON/OFF en direct (le toggle du menu
+        // MISC fait la même chose — raccourci pour le moments stream)
+        if pressed(VK_F10, &mut k_f10) {
+            opts.streamproof = !opts.streamproof;
+            debug::emit(format!("[strm] F10 → anti screen-share = {}", if opts.streamproof { "ACTIF (invisible OBS/Discord)" } else { "OFF (visible)" }));
         }
         if pressed(VK_F8, &mut k_f8) {
             if let Some(r) = renderer.as_ref() {
@@ -1351,6 +2039,7 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
                 gui::PanelEvent::Dump => dump_now(mem, offs),
                 gui::PanelEvent::Quit => {
                     debug::emit("[*] panneau → arrêt".into());
+                    tp.update(mem, offs, false, false, false, false); // v0.9 — nettoyage 3e personne
                     menu.save_now(&opts);
                     return ExitCode::UserQuit;
                 }
@@ -1374,6 +2063,7 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
         } else {
             fail_streak += 1;
             if fail_streak > 50 {
+                tp.update(mem, offs, false, false, false, false); // v0.9 — jeu fermé: writes no-op, état propre
                 menu.save_now(&opts);
                 return ExitCode::GameClosed;
             }
@@ -1405,9 +2095,17 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
 
         // snapshot des données — uniquement quand le jeu est au premier plan
         // (économie CPU + pas de fantômes au-dessus de Discord) ; les bones
-        // ne sont lues que si le squelette est activé.
+        // sont lues si squelette OU triggerbot par hitbox OU aimbot OU hitbox
+        // visuel actif (tous quatre consomment les os du cache squelette).
+        let want_bones = opts.skeleton || (opts.trigger && opts.trigger_hitbox != 0) || opts.aim || opts.hitbox;
         let snap = if game_fg {
-            entity::snapshot_full(mem, offs, debug::verbose() && frame_i % 150 == 0, opts.skeleton)
+            entity::snapshot_full(
+                mem,
+                offs,
+                debug::verbose() && frame_i % 150 == 0,
+                want_bones,
+                opts.trigger_hitbox,
+            )
         } else {
             None
         };
@@ -1425,14 +2123,183 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
             suppress_logged = false;
         }
 
-        // ── TRIGGERBOT: ennemi sous le viseur + touche + contexte de jeu sain ──
+        // ── v0.5: streamproof / thème LIVE (toggle au menu sans relancer) ──
+        if opts.streamproof != streamproof_on {
+            streamproof_on = opts.streamproof;
+            apply_streamproof(hwnd, streamproof_on);
+        }
+        if opts.theme != last_theme || opts.custom != last_custom {
+            last_theme = opts.theme;
+            last_custom = opts.custom;
+            if let Some(r) = renderer.as_mut() {
+                let t = theme::resolve(last_theme, &last_custom);
+                r.set_accent(t.primary, t.light);
+            }
+            dlog!("[thm ] thème → {}", theme::resolve(last_theme, &last_custom).name);
+        }
+
+        // ── v0.5: monde (armes au sol + grenades) — scan ~8 Hz si besoin ──
+        let want_world = (opts.weapon_esp || opts.grenade_trails) && game_fg;
+        if want_world && frame_i % 125 == 0 {
+            if let Some(el) = mem.read::<u64>(offs.entity_list(&mem.client)).filter(|p| (0x10000..0x0000_7FFF_FFFF_FFFF).contains(p)) {
+                world_state.scan(mem, offs, el);
+            }
+        }
+        if opts.grenade_trails && game_fg {
+            world_state.refresh_projectiles(mem, offs); // positions au frame de rendu
+        }
+
+        // ── v0.5: arme courante pour le labo (~2 Hz, lecture légère) ──
+        if opts.accuracy && frame_i % 500 == 0 {
+            if let (Some(s), Some(el)) = (
+                snap.as_ref().filter(|s| s.local_alive),
+                mem.read::<u64>(offs.entity_list(&mem.client)).filter(|p| (0x10000..0x0000_7FFF_FFFF_FFFF).contains(p)),
+            ) {
+                weapon_name = world::local_weapon_name(mem, offs, s.local_pawn, el);
+            }
+        }
+
+        // ── v0.5: bombe / sound esp / bhop / labo ──
+        if game_fg {
+            bomb.update(mem, offs, 0.0);
+        }
+        sound.update(snap.as_ref(), opts.sound_esp && game_fg);
+        let bhop_ctx = game_fg && !suppress && !menu.open && !buy_open;
+        bhop.update(snap.as_ref(), opts.bhop, vk_down(VK_SPACE), bhop_ctx);
+        lab.update(snap.as_ref(), opts.accuracy, weapon_name.as_deref());
+
+        // ── AIMBOT v0.5: vue dwViewAngles + gate vue fraîche + sens auto ──
+        // v0.8: mode SMOOTH/FLICK (opts.aim_mode) — le flick snap la tête en
+        // burst SendInput, dispo en LEGIT (zéro écriture mémoire).
+        let aim_ctx = game_fg && !suppress && !menu.open;
+        let sens_auto = if opts.aim_sens_auto { snap.as_ref().and_then(|s| s.local_sens) } else { None };
+        aimbot.update(
+            snap.as_ref(),
+            opts.aim,
+            aim_key_down(opts.aim_key),
+            opts.aim_hitbox,
+            opts.aim_fov,
+            opts.aim_smooth,
+            opts.aim_sens,
+            sens_auto,
+            aim_ctx,
+            opts.aim_mode,
+            opts.aim_pred_ms, // v0.9 — prédiction cibles mobiles
+            opts.aim_lock,   // v0.9 — verrouillage anti-stress
+            opts.aim_speed,  // v0.9.1 — vitesse de visée (gain × plafond)
+            opts.aim_punch,  // v0.9.3 — compensation du recul dans la visée
+        );
+
+        // ── TRIGGERBOT v3 (v0.9.6): « À CHAQUE TIR JE TOUCHE LA TÊTE » ──
+        // Le triggerbot est maintenant COUPLÉ à l'aimbot (bloc déplacé
+        // APRÈS aimbot.update: il consomme l'état de la MÊME frame).
+        //   · zone_ok  = le check classique (m_iIDEntIndex / projection
+        //                normalisée selon le mode tête/corps/membres)
+        //   · head_ready = GATE PHYSIQUE: l'aimbot tient une cible ET la
+        //                balle partant maintenant (vue + punch) atterrit
+        //                DANS la hitbox tête (écart ≤ rayon angulaire réel
+        //                ≈ 3.2 u à la distance mesurée — aimcore)
+        //   · trigger_head_only (défaut ON) + aimbot en visée: le gate tête
+        //                est la SEULE condition — AUCUNE balle ne part pour
+        //                le corps. Sans aimbot actif, le mode zone classique
+        //                s'applique (un externe sans aimbot ne peut pas
+        //                garantir une tête qu'il ne vise pas).
+        let zone_ok = snap
+            .as_ref()
+            .map(|s| s.local_alive && s.crosshair_enemy)
+            .unwrap_or(false);
+        let aim_gating = opts.aim && aimbot.active;
+        let head_ready = aim_gating && aimbot.head_shot_ready;
+        let fire_ok = if opts.trigger_head_only && aim_gating {
+            head_ready // gate tête SEUL: chaque balle part pour la tête
+        } else {
+            zone_ok || head_ready
+        };
+        trig_head_ready = head_ready;
         let trig_conditions = game_fg
             && !suppress
             && !menu.open
             && opts.trigger
-            && snap.as_ref().map(|s| s.local_alive && s.crosshair_enemy).unwrap_or(false)
+            && snap.as_ref().map(|s| s.local_alive).unwrap_or(false)
+            && fire_ok
             && trigger_key_down(opts.trigger_key);
-        trigger.update(trig_conditions, opts.trigger_delay_ms.max(0.0) as u32);
+        trigger.update(
+            trig_conditions,
+            opts.trigger_delay_ms.max(0.0) as u32,
+            head_ready,
+        );
+
+        // ── v0.5: RCS — après l'aimbot (même canal souris, updates indépendants).
+        // sensibilité effective = celle lue si auto, sinon la manuelle.
+        // v0.7: rcs_punch bascule le mode — delta-based (classique) OU punch
+        // feed-forward (balistique intégrale, voir NoRecoil) — jamais les deux.
+        let sens_eff = sens_auto.unwrap_or(opts.aim_sens);
+        // v0.8.2 — aimbot.active en argument: le RCS ne compense plus les
+        // mouvements de l'aimbot comme du recul pendant les sprays.
+        rcs.update(snap.as_ref(), opts.rcs && !opts.rcs_punch, opts.rcs_strength, sens_eff, aim_ctx && !buy_open, aimbot.active);
+
+        // ── v0.8 — CYCLE DU HANDLE RAGE (voie B gated) ──
+        if opts.rage_mode != rage_last {
+            rage_last = opts.rage_mode;
+            if opts.rage_mode {
+                mem.open_write();
+            } else {
+                mem.close_write();
+            }
+        }
+        let rage_on = mem.write_open();
+
+        // ── v0.7: SILENT AIM — le clic réel part déplacé (restore prioritaire,
+        // traité avant tout le reste dans son update). v0.8: GATED sur le
+        // master RAGE — endormi en LEGIT même si coché. ──
+        silent.update(
+            snap.as_ref(),
+            opts.silent && rage_on,
+            opts.silent_fov,
+            opts.silent_hitbox,
+            opts.aim_sens,
+            sens_auto,
+            aimbot.active,
+            aim_ctx && !buy_open,
+        );
+
+        // ── v0.7.1: SPINBOT — écriture directe dwViewAngles. Cède à l'aimbot
+        // verrouillé ET au flick EN COURS du silent aim (flicking(), plus
+        // `armed`: avant, le spin était coupé dès qu'une cible entrait dans
+        // le FOV silent — l'anti-aim mourait au pire moment — et tournait
+        // PENDANT le flick réel en écrasant l'angle du tir). v0.8: GATED sur le
+        // master RAGE — mem.write() est no-op sans handle RW, on évite en
+        // amont le calcul inutile. ──
+        spin.update(
+            mem,
+            offs,
+            snap.as_ref(),
+            opts.spin && rage_on,
+            opts.spin_mode,
+            opts.spin_speed,
+            opts.spin_pitch,
+            aimbot.active,
+            silent.flicking(),
+            aim_ctx && !buy_open,
+            opts.spin_ghost_us, // v0.9 — fenêtre GHOST (mode 4)
+        );
+
+        // ── v0.9: CAMÉRA 3E PERSONNE — flag CSGOInput à chaque itération (le
+        // jeu le reset par frame), patch moteur opt-in. Gated RAGE comme le
+        // spinbot: endormi en LEGIT. Ne tourne que VIVANT (la 3e personne
+        // spectateur existe déjà nativement). ──
+        let local_alive = snap.as_ref().map(|s| s.local_alive).unwrap_or(false);
+        tp.update(
+            mem,
+            offs,
+            opts.thirdperson && rage_on,
+            aim_ctx && !buy_open,
+            local_alive,
+            opts.tp_patch,
+        );
+
+        // ── v0.7: NO-RECOIL punch FF (si coché à la place du delta) ──
+        norecoil.update(snap.as_ref(), opts.rcs && opts.rcs_punch, opts.rcs_strength, sens_eff, aim_ctx && !buy_open);
 
         // panneau: journal en miroir + statut resynchronisé (2×/s)
         if let Some(p) = panel.as_ref() {
@@ -1447,8 +2314,9 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
                 };
                 let rendu = if renderer.is_some() { "OK — Direct2D + ULW" } else { "ÉCHEC (voir journal)" };
                 p.set_status(&format!(
-                    "cs2-esp v0.3.0 (menu glass: INSERT)\r\npid {} │ {:.0} fps │ snapshot: {}\r\nrendu overlay: {} │ coéquipiers: {}\r\noffsets: dump local 29.10.2026 — build 14193 (cs2-dumper)",
-                    mem.pid, fps, verdict, rendu, if opts.teammates { "oui" } else { "non" }
+                    "Vantyx.cc v0.9.4 (menu glass: INSERT)\r\npid {} │ {:.0} fps │ snapshot: {}\r\nrendu overlay: {} │ coéquipiers: {} │ thème: {}\r\noffsets: dump local 29.10.2026 — build 14193 · streamproof: {}",
+                    mem.pid, fps, verdict, rendu, if opts.teammates { "oui" } else { "non" },
+                    theme::resolve(opts.theme, &opts.custom).name, if streamproof_on { "ACTIF" } else { "off" }
                 ));
             }
         }
@@ -1468,20 +2336,68 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
             let st = StatusInfo {
                 pid: mem.pid,
                 fps,
-                players: snap.as_ref().map(|s| s.players.len()).unwrap_or(0),
+                players: snap.as_ref().map(|s| s.players.iter().filter(|p| p.alive).count()).unwrap_or(0),
                 snapshot_ok: snap.is_some(),
                 renderer_ok: renderer.is_some(),
                 config_path: config_disp.clone(),
                 trigger_armed: trigger.armed_visual,
+                trigger_head_ready: trig_head_ready,
                 game_fg,
                 font: renderer.as_ref().map(|r| r.font_src.clone()).unwrap_or_else(|| "—".into()),
+                aim_active: aimbot.active,
+                aim_target: if aimbot.active {
+                    format!("{} · {:.0} m", aimbot.target, aimbot.dist_m)
+                } else {
+                    "—".into()
+                },
+                aim_delta: if aimbot.delta_deg.is_finite() { aimbot.delta_deg } else { 0.0 },
+                aim_send_rate: aimbot.send_rate,
+                aim_flicks: aimbot.flicks,
+                // v0.9.1 — visuels de visée (monde): tête brute + point prédit
+                aim_vis: aimbot.aim_point.map(|v| (v.x, v.y, v.z)),
+                aim_vis_pred: aimbot.pred_point.map(|v| (v.x, v.y, v.z)),
+                view_src: snap.as_ref().map(|s| s.local_view_src).unwrap_or("—"),
+                sens_effective: snap.as_ref().and_then(|s| s.local_sens),
+                rage_on,
+                rcs_active: rcs.active,
+                rcs_kick: rcs.last_kick,
+                // v0.7 — rage
+                spin_active: spin.writes > 0,
+                spin_written: spin.last_written,
+                // v0.9 — 3e personne + diagnostics aim
+                tp_active: tp.writes > 0,
+                tp_mode: tp.mode,
+                aim_switches: aimbot.switches,
+                aim_learn: aimbot.model_samples,
+                aim_w_lead: aimbot.model_w_lead,
+                aim_err_u: aimbot.model_err_u,
+                aim_punch_on: aimbot.aim_on_head,
+                aim_punch_deg: aimbot.punch_deg,
+                silent_armed: silent.armed,
+                silent_flicks: silent.flicks,
+                silent_target: silent.last_target.clone(),
+                nr_active: norecoil.active,
+                nr_last: norecoil.last_comp,
+                nr_punch: snap.as_ref().and_then(|s| s.local_punch),
+                bomb_planted: bomb.planted && !bomb.defused,
+                bomb_remaining_s: bomb.remaining_s,
+                bomb_clock: bomb.clock_src,
+                spectator_count: snap.as_ref().map(|s| s.spectators.len()).unwrap_or(0),
+                acc_shots: lab.shots,
+                acc_hits: lab.hits,
+                acc_kills: lab.kills,
+                acc_damage: lab.damage,
+                acc_weapon: lab.weapon.clone(),
+                bhop_jumps: bhop.jumps,
+                world_items: world_state.items.len(),
+                grenades_live: world_state.projectiles.iter().filter(|p| p.dead_since.is_none()).count(),
             };
             // une panique de frame ne tue pas l'overlay
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if red_test {
                     r_red_test(&renderer, w, h)
                 } else {
-                    renderer.as_ref().map(|r| r.frame(snap.as_ref(), &mut opts, &mut menu, &mut mouse, &st, fps, w, h, dt, suppress))
+                    renderer.as_ref().map(|r| r.frame(snap.as_ref(), &mut opts, &mut menu, &mut mouse, &st, fps, w, h, dt, suppress, &world_state, &sound, &bomb))
                 }
             }));
             let actions = match result {
@@ -1531,6 +2447,8 @@ pub fn run(mem: &Mem, offs: &Offsets, cfg: Config) -> ExitCode {
             }
         }
 
-        unsafe { Sleep(opts.interval_ms.clamp(1, 50) as u32); }
+        // v0.8 — le wait passe au TIMER HAUTE RÉSOLUTION (~0,5 ms au lieu de
+        // la granularité 15,625 ms par défaut de Sleep)
+        hi_wait.wait(opts.interval_ms.clamp(1, 50) as u32);
     }
 }

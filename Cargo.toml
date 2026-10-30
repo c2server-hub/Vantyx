@@ -1,6 +1,13 @@
+[workspace]
+# v0.6 — workspace: le cheat (racine) + le launcher (crate séparée).
+#   cargo build --release            → tout (vantyx.exe + launcher)
+#   cargo build --release -p vantyx-launcher → le launcher seul
+members = ["launcher"]
+resolver = "2"
+
 [package]
-name = "cs2-esp"
-version = "0.3.0"
+name = "vantyx"
+version = "0.9.6"
 edition = "2021"
 
 # windows-rs PINÉ en 0.58.0 — toutes les signatures du code ont été vérifiées
@@ -10,6 +17,7 @@ edition = "2021"
 [dependencies]
 windows = { version = "=0.58.0", features = [
     "Win32_Foundation",
+    "Win32_Security", # ← SECURITY_ATTRIBUTES requis par CreateWaitableTimerExW (timer HR v0.8)
     "Foundation_Numerics", # ← débloque ID2D1RenderTarget::CreateSolidColorBrush (feature-gated)
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
@@ -24,7 +32,13 @@ windows = { version = "=0.58.0", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls", # ← BST_CHECKED/BST_UNCHECKED (cases à cocher du panneau GUI)
     "Win32_Graphics_DirectWrite", # ← DWriteCreateFactory/IDWriteTextFormat — texte du menu glass (alpha prémultiplié)
+    "Win32_Media", # ← timeBeginPeriod(1) — granularité timer système 15.6ms → 1ms (v0.8)
 ] }
 
 [profile.release]
-lto = "thin"
+# v0.8 — lto FAT + codegen-units 1: binaire plus dense, inlining complet à
+# travers les crates (windows-rs compris), zéro symbole résiduel. panic reste
+# "unwind" (overlay.rs protège le rendu par catch_unwind — abort casserait
+# ce filet de sécurité).
+lto = "fat"
+codegen-units = 1

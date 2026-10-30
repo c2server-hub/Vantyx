@@ -24,9 +24,29 @@ impl Vec3 {
     pub fn dist(&self, o: &Vec3) -> f32 {
         ((self.x - o.x).powi(2) + (self.y - o.y).powi(2) + (self.z - o.z).powi(2)).sqrt()
     }
+    /// norme euclidienne (v0.9 — prédiction aimbot: vitesse de la cible)
+    pub fn len(&self) -> f32 {
+        (self.x.powi(2) + self.y.powi(2) + self.z.powi(2)).sqrt()
+    }
     pub fn z_up(&self, dz: f32) -> Vec3 {
         Vec3 { x: self.x, y: self.y, z: self.z + dz }
     }
+    /// v0.8 — INTERPOLATION DE RENDU: self + v·t (extrapole la position par
+    /// la vélocité lue). Utilisé UNIQUEMENT côté dessin: le serveur tick à
+    /// 64 Hz vu à ~166 fps fait avancer les boîtes par pas sinon — la logique
+    /// de tir (trigger/aim) reste sur les positions BRUTES du snapshot.
+    pub fn add_scaled(&self, v: &Vec3, t: f32) -> Vec3 {
+        Vec3 { x: self.x + v.x * t, y: self.y + v.y * t, z: self.z + v.z * t }
+    }
+}
+
+/// normalise un angle degrés dans (-180..180] (utilisé par l'aimbot v0.4)
+pub fn wrap180(a: f32) -> f32 {
+    let mut d = a.rem_euclid(360.0);
+    if d > 180.0 {
+        d -= 360.0;
+    }
+    d
 }
 
 // hauteur d'un joueur debout en unités Source — l'origine est aux PIEDS,

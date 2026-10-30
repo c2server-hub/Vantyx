@@ -1,8 +1,8 @@
 // build.rs — copie fonts/*.ttf + offsets.json à CÔTÉ DU FUTUR EXE
-// (target/<profile>/) pour que cs2-esp.exe trouve la police Space Grotesk
+// (target/<profile>/) pour que vantyx.exe trouve la police Space Grotesk
 // et les offsets sans manipulation manuelle après `cargo build --release`.
 //
-// OUT_DIR = target/<profile>/build/cs2-esp-<hash>/out
+// OUT_DIR = target/<profile>/build/vantyx-<hash>/out
 //   → ancestors().nth(3) = target/<profile>  (là où cargo pose l'exe)
 use std::path::PathBuf;
 
